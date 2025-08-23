@@ -1,0 +1,39 @@
+TYPEMAP
+Twom_DB *       O_TWOM_DB
+Twom_Txn *      O_TWOM_TXN
+Twom_Cursor *   O_TWOM_CURSOR
+
+INPUT
+O_TWOM_DB
+    if (sv_derived_from($arg, \"Twom::DB\")) {
+        IV tmp = SvIV((SV*)SvRV($arg));
+        $var = (Twom_DB *)tmp;
+    } else {
+        croak(\"Expected a Twom::DB\");
+    }
+
+O_TWOM_TXN
+    if (sv_derived_from($arg, \"Twom::Txn\")) {
+        IV tmp = SvIV((SV*)SvRV($arg));
+        $var = (Twom_Txn *)tmp;
+    } else {
+        croak(\"Expected a Twom::Txn\");
+    }
+
+O_TWOM_CURSOR
+    if (sv_derived_from($arg, \"Twom::Cursor\")) {
+        IV tmp = SvIV((SV*)SvRV($arg));
+        $var = (Twom_Cursor *)tmp;
+    } else {
+        croak(\"Expected a Twom::Cursor\");
+    }
+
+OUTPUT
+O_TWOM_DB
+    sv_setref_pv($arg, \"Twom::DB\", (void*)$var);
+
+O_TWOM_TXN
+    sv_setref_pv($arg, \"Twom::Txn\", (void*)$var);
+
+O_TWOM_CURSOR
+    sv_setref_pv($arg, \"Twom::Cursor\", (void*)$var);
