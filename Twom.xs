@@ -18,7 +18,7 @@ typedef struct twom_cursor Twom_Cursor;
 static void
 twom_boot_constants(pTHX)
 {
-    HV *stash = NULL;
+    HV *stash = gv_stashpv("Twom", GV_ADD);
 
     /* return codes */
     newCONSTSUB(stash, "TWOM_OK",           newSViv(0));
