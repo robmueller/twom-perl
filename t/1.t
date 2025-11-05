@@ -27,7 +27,7 @@ $db->foreach("", sub {
     is($rock, "context", "expected context passed");
     $m{$k} = $v;
     return 0;
-}, 0, "context");
+}, undef, "context");
 
 is(scalar(keys %m), 1, "a single key");
 is($m{k1}, "v1", "key and value as expected");
@@ -47,7 +47,7 @@ is($db->fetch("k2"), "v2", "value stored on commit");
 
 # Cursor
 %m = ();
-my $cur = $db->begin_cursor("k2", 0); # start at k2
+my $cur = $db->begin_cursor("k2"); # start at k2
 while ( my ($ck, $cv) = $cur->next ) {
     $m{$ck} = $cv;
 }
@@ -63,6 +63,31 @@ is($db->num_records, 2, "2 records");
 $db->repack;
 
 is($db->generation, 2, "db is generation 2");
+
+# Test hashref flags
+# Test ifnotexist flag
+my $rc = $db->store("k3", "v3", { ifnotexist => 1 });
+is($rc, 0, "store with ifnotexist succeeded");
+
+eval {
+    $db->store("k3", "v3_new", { ifnotexist => 1 });
+};
+ok($@, "store with ifnotexist on existing key failed as expected");
+
+# Test ifexist flag
+$rc = $db->store("k3", "v3_updated", { ifexist => 1 });
+is($rc, 0, "store with ifexist succeeded");
+is($db->fetch("k3"), "v3_updated", "value was updated");
+
+# TWOM_IFEXIST on non-existing key returns TWOM_NOTFOUND but doesn't croak
+$rc = $db->store("nonexistent", "value", { ifexist => 1 });
+isnt($rc, 0, "store with ifexist on non-existing key returns error code");
+
+# Test invalid flag
+eval {
+    $db->store("k4", "v4", { invalidflag => 1 });
+};
+ok($@ && $@ =~ /invalid flag/, "invalid flag throws error");
 
 $db = undef;
 

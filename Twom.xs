@@ -20,7 +20,7 @@ twom_boot_constants(pTHX)
 {
     HV *stash = NULL;
 
-    /* return codes */
+    /* return codes - still exported for error handling */
     newCONSTSUB(stash, "TWOM_OK",           newSViv(0));
     newCONSTSUB(stash, "TWOM_DONE",         newSViv(1));
     newCONSTSUB(stash, "TWOM_EXISTS",       newSViv(-1));
@@ -33,24 +33,7 @@ twom_boot_constants(pTHX)
     newCONSTSUB(stash, "TWOM_BADUSAGE",     newSViv(-8));
     newCONSTSUB(stash, "TWOM_BADCHECKSUM",  newSViv(-9));
 
-    /* flags */
-    newCONSTSUB(stash, "TWOM_CREATE",          newSVuv(1u<<0));
-    newCONSTSUB(stash, "TWOM_SHARED",          newSVuv(1u<<1));
-    newCONSTSUB(stash, "TWOM_NOCSUM",          newSVuv(1u<<2));
-    newCONSTSUB(stash, "TWOM_NOSYNC",          newSVuv(1u<<3));
-    newCONSTSUB(stash, "TWOM_NONBLOCKING",     newSVuv(1u<<4));
-    newCONSTSUB(stash, "TWOM_ALWAYSYIELD",     newSVuv(1u<<9));
-    newCONSTSUB(stash, "TWOM_NOYIELD",         newSVuv(1u<<10));
-    newCONSTSUB(stash, "TWOM_IFNOTEXIST",      newSVuv(1u<<11));
-    newCONSTSUB(stash, "TWOM_IFEXIST",         newSVuv(1u<<12));
-    newCONSTSUB(stash, "TWOM_FETCHNEXT",       newSVuv(1u<<13));
-    newCONSTSUB(stash, "TWOM_SKIPROOT",        newSVuv(1u<<14));
-    newCONSTSUB(stash, "TWOM_MVCC",            newSVuv(1u<<15));
-    newCONSTSUB(stash, "TWOM_CURSOR_PREFIX",   newSVuv(1u<<16));
-    newCONSTSUB(stash, "TWOM_CSUM_NULL",       newSVuv(1u<<27));
-    newCONSTSUB(stash, "TWOM_CSUM_XXH64",      newSVuv(1u<<28));
-    newCONSTSUB(stash, "TWOM_CSUM_EXTERNAL",   newSVuv(1u<<29));
-    newCONSTSUB(stash, "TWOM_COMPAR_EXTERNAL", newSVuv(1u<<30));
+    /* flags are no longer exported - use hashref options instead */
 }
 
 /* ---- Helpers ---- */
@@ -120,6 +103,60 @@ xs_twom_error(const char *msg, const char *fmt, ...)
     SvREFCNT_dec(sv);
 }
 
+/* Flag parsing helper */
+typedef struct {
+    const char *name;
+    UV flag;
+} FlagMap;
+
+static UV
+parse_flags(pTHX_ SV *flags_sv, const FlagMap *valid_flags, size_t num_flags, const char *context)
+{
+    UV flags = 0;
+
+    /* If not defined, return 0 */
+    if (!flags_sv || !SvOK(flags_sv)) {
+        return 0;
+    }
+
+    /* If it's a hashref, parse it */
+    if (SvROK(flags_sv) && SvTYPE(SvRV(flags_sv)) == SVt_PVHV) {
+        HV *hv = (HV*)SvRV(flags_sv);
+        HE *entry;
+
+        hv_iterinit(hv);
+        while ((entry = hv_iternext(hv))) {
+            I32 keylen;
+            const char *key = hv_iterkey(entry, &keylen);
+            SV *val = hv_iterval(hv, entry);
+
+            /* Skip if value is false */
+            if (!SvTRUE(val)) continue;
+
+            /* Find matching flag */
+            bool found = false;
+            for (size_t i = 0; i < num_flags; i++) {
+                if (strlen(valid_flags[i].name) == (size_t)keylen &&
+                    strncmp(valid_flags[i].name, key, (size_t)keylen) == 0) {
+                    flags |= valid_flags[i].flag;
+                    found = true;
+                    break;
+                }
+            }
+
+            if (!found) {
+                croak("%s: invalid flag '%.*s'", context, (int)keylen, key);
+            }
+        }
+    } else {
+        croak("%s: flags must be a hashref", context);
+    }
+
+    return flags;
+}
+
+#define PARSE_FLAGS(sv, map, ctx) parse_flags(aTHX_ (sv), (map), sizeof(map)/sizeof((map)[0]), (ctx))
+
 /* ---- XS ---- */
 
 MODULE = Twom           PACKAGE = Twom
@@ -133,47 +170,29 @@ BOOT:
 PROTOTYPES: ENABLE
 
 void
-open(class, fname, opts=Nullhv)
+open(class, fname, opts=NULL)
     const char *class
     const char *fname
-    HV *opts
+    SV *opts
   PPCODE:
     {
         struct twom_open_data setup = TWOM_OPEN_DATA_INITIALIZER;
         struct twom_db *db = NULL;
         UV flags = 0;
 
-        if (opts) {
-            SV **svp;
-            if ((svp = hv_fetch(opts, "flags", 5, 0)) && SvOK(*svp))
-                flags |= SvUV(*svp);
+        /* Valid flags for open */
+        static const FlagMap open_flags[] = {
+            {"create",       TWOM_CREATE},
+            {"shared",       TWOM_SHARED},
+            {"nocsum",       TWOM_NOCSUM},
+            {"nosync",       TWOM_NOSYNC},
+            {"nonblocking",  TWOM_NONBLOCKING},
+            {"csum_null",    TWOM_CSUM_NULL},
+            {"csum_xxh64",   TWOM_CSUM_XXH64},
+        };
 
-            /* convenience booleans */
-            const struct { const char *k; UV f; } map[] = {
-                {"create",       1u<<0},
-                {"shared",       1u<<1},
-                {"nocsum",       1u<<2},
-                {"nosync",       1u<<3},
-                {"nonblocking",  1u<<4},
-                {"alwaysyield",  1u<<9},
-                {"noyield",      1u<<10},
-                {"ifnotexist",   1u<<11},
-                {"ifexist",      1u<<12},
-                {"fetchnext",    1u<<13},
-                {"skiproot",     1u<<14},
-                {"mvcc",         1u<<15},
-                {"cursor_prefix",1u<<16},
-                /* Checksumming/compar are deliberately NOT enabled via opts */
-            };
-            for (unsigned i=0; i<sizeof(map)/sizeof(map[0]); i++) {
-                SV **v = hv_fetch(opts, map[i].k, (I32)strlen(map[i].k), 0);
-                if (v && SvTRUE(*v)) flags |= map[i].f;
-            }
-        }
-
-        /* Refuse external compar/csum from Perl for now (no rock/context). */
-        if (flags & ((1u<<29) | (1u<<30))) {
-            croak("TWOM_CSUM_EXTERNAL/TWOM_COMPAR_EXTERNAL are not supported from Perl XS safely");
+        if (opts && SvOK(opts)) {
+            flags = PARSE_FLAGS(opts, open_flags, "open");
         }
 
         setup.flags = (uint32_t)flags;
@@ -279,17 +298,22 @@ yield(db)
   OUTPUT: RETVAL
 
 void
-fetch(db, key_sv, flags = 0)
+fetch(db, key_sv, opts=NULL)
     Twom_DB *db
     SV *key_sv
-    int flags
+    SV *opts
   PPCODE:
     {
+        static const FlagMap fetch_flags[] = {
+            {"fetchnext", TWOM_FETCHNEXT},
+        };
+        UV flags = PARSE_FLAGS(opts, fetch_flags, "fetch");
+
         STRLEN klen;
         const char *k = SvPV(key_sv, klen);
         const char *keyp = NULL, *valp = NULL;
         size_t keylen = 0, vallen = 0;
-        int rc = twom_db_fetch(db, k, (size_t)klen, &keyp, &keylen, &valp, &vallen, flags);
+        int rc = twom_db_fetch(db, k, (size_t)klen, &keyp, &keylen, &valp, &vallen, (int)flags);
         if (rc == TWOM_NOTFOUND || rc == TWOM_DONE) XSRETURN_EMPTY;
         CROAK_ON_NEG(rc, "twom_db_fetch");
 
@@ -298,17 +322,24 @@ fetch(db, key_sv, flags = 0)
     }
 
 int
-store(db, key_sv, val_sv, flags = 0)
+store(db, key_sv, val_sv, opts=NULL)
     Twom_DB *db
     SV *key_sv
     SV *val_sv
-    int flags
+    SV *opts
   CODE:
     {
+        static const FlagMap store_flags[] = {
+            {"ifnotexist", TWOM_IFNOTEXIST},
+            {"ifexist",    TWOM_IFEXIST},
+            {"nosync",     TWOM_NOSYNC},
+        };
+        UV flags = PARSE_FLAGS(opts, store_flags, "store");
+
         STRLEN klen, vlen;
         const char *k = SvPV(key_sv, klen);
         const char *v = SvPV(val_sv, vlen);
-        int rc = twom_db_store(db, k, (size_t)klen, v, (size_t)vlen, flags);
+        int rc = twom_db_store(db, k, (size_t)klen, v, (size_t)vlen, (int)flags);
         CROAK_ON_NEG(rc, "twom_db_store");
         RETVAL = rc; /* usually 0 */
     }
@@ -323,14 +354,21 @@ dump(db, detail = 0)
   OUTPUT: RETVAL
 
 void
-foreach(db, prefix_sv, cb, flags = 0, rock = &PL_sv_undef)
+foreach(db, prefix_sv, cb, opts=NULL, rock=&PL_sv_undef)
     Twom_DB *db
     SV *prefix_sv
     SV *cb
-    int flags
+    SV *opts
     SV *rock
   PPCODE:
     {
+        static const FlagMap foreach_flags[] = {
+            {"alwaysyield", TWOM_ALWAYSYIELD},
+            {"noyield",     TWOM_NOYIELD},
+            {"skiproot",    TWOM_SKIPROOT},
+        };
+        UV flags = PARSE_FLAGS(opts, foreach_flags, "foreach");
+
         if (!SvROK(cb) || SvTYPE(SvRV(cb)) != SVt_PVCV) {
             croak("foreach requires a coderef");
         }
@@ -342,7 +380,7 @@ foreach(db, prefix_sv, cb, flags = 0, rock = &PL_sv_undef)
         ctx.rock = SvREFCNT_inc_NN(rock);
 
         int rc = twom_db_foreach(db, prefix, (size_t)plen,
-                                 NULL /* p */, xs_twom_cb, (void*)&ctx, flags);
+                                 NULL /* p */, xs_twom_cb, (void*)&ctx, (int)flags);
 
         SvREFCNT_dec(ctx.cb);
         SvREFCNT_dec(ctx.rock);
@@ -366,15 +404,22 @@ begin_txn(db, shared = 0)
   OUTPUT: RETVAL
 
 Twom_Cursor *
-begin_cursor(db, key_sv, flags = 0)
+begin_cursor(db, key_sv, opts=NULL)
     Twom_DB *db
     SV *key_sv
-    int flags
+    SV *opts
   CODE:
     {
+        static const FlagMap cursor_flags[] = {
+            {"mvcc",          TWOM_MVCC},
+            {"cursor_prefix", TWOM_CURSOR_PREFIX},
+            {"noyield",       TWOM_NOYIELD},
+        };
+        UV flags = PARSE_FLAGS(opts, cursor_flags, "begin_cursor");
+
         STRLEN klen; const char *k = SvPV(key_sv, klen);
         struct twom_cursor *cur = NULL;
-        int rc = twom_db_begin_cursor(db, k, (size_t)klen, &cur, flags);
+        int rc = twom_db_begin_cursor(db, k, (size_t)klen, &cur, (int)flags);
         CROAK_ON_NEG(rc, "twom_db_begin_cursor");
         RETVAL = cur;
     }
@@ -420,17 +465,22 @@ yield(txn)
   OUTPUT: RETVAL
 
 void
-fetch(txn, key_sv, flags = 0)
+fetch(txn, key_sv, opts=NULL)
     Twom_Txn *txn
     SV *key_sv
-    int flags
+    SV *opts
   PPCODE:
     {
+        static const FlagMap fetch_flags[] = {
+            {"fetchnext", TWOM_FETCHNEXT},
+        };
+        UV flags = PARSE_FLAGS(opts, fetch_flags, "txn fetch");
+
         STRLEN klen;
         const char *k = SvPV(key_sv, klen);
         const char *keyp = NULL, *valp = NULL;
         size_t keylen = 0, vallen = 0;
-        int rc = twom_txn_fetch(txn, k, (size_t)klen, &keyp, &keylen, &valp, &vallen, flags);
+        int rc = twom_txn_fetch(txn, k, (size_t)klen, &keyp, &keylen, &valp, &vallen, (int)flags);
         if (rc == TWOM_NOTFOUND || rc == TWOM_DONE) XSRETURN_EMPTY;
         CROAK_ON_NEG(rc, "twom_txn_fetch");
 
@@ -439,31 +489,45 @@ fetch(txn, key_sv, flags = 0)
     }
 
 int
-store(txn, key_sv, val_sv, flags = 0)
+store(txn, key_sv, val_sv, opts=NULL)
     Twom_Txn *txn
     SV *key_sv
     SV *val_sv
-    int flags
+    SV *opts
   CODE:
     {
+        static const FlagMap store_flags[] = {
+            {"ifnotexist", TWOM_IFNOTEXIST},
+            {"ifexist",    TWOM_IFEXIST},
+        };
+        UV flags = PARSE_FLAGS(opts, store_flags, "txn store");
+
         STRLEN klen, vlen;
         const char *k = SvPV(key_sv, klen);
         const char *v = SvPV(val_sv, vlen);
-        int rc = twom_txn_store(txn, k, (size_t)klen, v, (size_t)vlen, flags);
+        int rc = twom_txn_store(txn, k, (size_t)klen, v, (size_t)vlen, (int)flags);
         CROAK_ON_NEG(rc, "twom_txn_store");
         RETVAL = rc;
     }
   OUTPUT: RETVAL
 
 void
-foreach(txn, prefix_sv, cb, flags = 0, rock = &PL_sv_undef)
+foreach(txn, prefix_sv, cb, opts=NULL, rock=&PL_sv_undef)
     Twom_Txn *txn
     SV *prefix_sv
     SV *cb
-    int flags
+    SV *opts
     SV *rock
   PPCODE:
     {
+        static const FlagMap foreach_flags[] = {
+            {"alwaysyield", TWOM_ALWAYSYIELD},
+            {"noyield",     TWOM_NOYIELD},
+            {"skiproot",    TWOM_SKIPROOT},
+            {"mvcc",        TWOM_MVCC},
+        };
+        UV flags = PARSE_FLAGS(opts, foreach_flags, "txn foreach");
+
         if (!SvROK(cb) || SvTYPE(SvRV(cb)) != SVt_PVCV) {
             croak("foreach requires a coderef");
         }
@@ -475,7 +539,7 @@ foreach(txn, prefix_sv, cb, flags = 0, rock = &PL_sv_undef)
         ctx.rock = SvREFCNT_inc_NN(rock);
 
         int rc = twom_txn_foreach(txn, prefix, (size_t)plen,
-                                  NULL /* p */, xs_twom_cb, (void*)&ctx, flags);
+                                  NULL /* p */, xs_twom_cb, (void*)&ctx, (int)flags);
 
         SvREFCNT_dec(ctx.cb);
         SvREFCNT_dec(ctx.rock);
@@ -485,15 +549,22 @@ foreach(txn, prefix_sv, cb, flags = 0, rock = &PL_sv_undef)
     }
 
 Twom_Cursor *
-begin_cursor(txn, key_sv, flags = 0)
+begin_cursor(txn, key_sv, opts=NULL)
     Twom_Txn *txn
     SV *key_sv
-    int flags
+    SV *opts
   CODE:
     {
+        static const FlagMap cursor_flags[] = {
+            {"mvcc",          TWOM_MVCC},
+            {"cursor_prefix", TWOM_CURSOR_PREFIX},
+            {"noyield",       TWOM_NOYIELD},
+        };
+        UV flags = PARSE_FLAGS(opts, cursor_flags, "txn begin_cursor");
+
         STRLEN klen; const char *k = SvPV(key_sv, klen);
         struct twom_cursor *cur = NULL;
-        int rc = twom_txn_begin_cursor(txn, k, (size_t)klen, &cur, flags);
+        int rc = twom_txn_begin_cursor(txn, k, (size_t)klen, &cur, (int)flags);
         CROAK_ON_NEG(rc, "twom_txn_begin_cursor");
         RETVAL = cur;
     }
@@ -547,14 +618,20 @@ next(cur)
     }
 
 int
-replace(cur, val_sv, flags = 0)
+replace(cur, val_sv, opts=NULL)
     Twom_Cursor *cur
     SV *val_sv
-    int flags
+    SV *opts
   CODE:
     {
+        static const FlagMap replace_flags[] = {
+            {"ifnotexist", TWOM_IFNOTEXIST},
+            {"ifexist",    TWOM_IFEXIST},
+        };
+        UV flags = PARSE_FLAGS(opts, replace_flags, "cursor replace");
+
         STRLEN vlen; const char *v = SvPV(val_sv, vlen);
-        int rc = twom_cursor_replace(cur, v, (size_t)vlen, flags);
+        int rc = twom_cursor_replace(cur, v, (size_t)vlen, (int)flags);
         CROAK_ON_NEG(rc, "twom_cursor_replace");
         RETVAL = rc;
     }
